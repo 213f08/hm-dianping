@@ -3,12 +3,23 @@ package com.hmdp;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.RedisIdWorker;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 import javax.annotation.Resource;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.ArrayList;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 
@@ -21,6 +32,9 @@ class HmDianPingApplicationTests {
 
     @Resource
     private IShopService shopService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
 
     /**
      * 缓存预热（逻辑过期时间较长，用于验证「未过期」路径）
@@ -63,4 +77,83 @@ class HmDianPingApplicationTests {
         log.info("预热完成：key={}，逻辑过期时间={} 秒后（Redis TTL 应为 -1，即永不过期）",
                 CACHE_SHOP_KEY + id, expireSeconds);
     }
+
+    /**
+     * 全局唯一 ID 压测：300 线程 × 100 次 = 30000 个 ID
+     *
+     * 验证三件事：
+     *   1. 【唯一性】30000 个 ID 无重复 —— 这是全局 ID 生成器的底线
+     *   2. 【递增性】ID 随时间趋势递增（时间戳部分）
+     *   3. 【吞吐量】记录总耗时
+     *
+     * 用 CountDownLatch 做「发令枪」：让 300 个线程尽可能同时开跑，
+     * 制造最大并发冲突，比顺序生成更容易暴露重复问题。
+     */
+    @Test
+    void testIdWorker() throws InterruptedException {
+        int threadCount = 300;
+        int perThread = 100;
+
+        // Set 用于去重检查；ConcurrentHashMap.newKeySet 是线程安全的 Set
+        Set<Long> ids = ConcurrentHashMap.newKeySet();
+        // 另外单独记录一份（保留全部，用于统计总数）
+        List<Long> allIds = Collections.synchronizedList(new ArrayList<>());
+
+        ExecutorService es = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch readyLatch = new CountDownLatch(threadCount);   // 所有线程就绪
+        CountDownLatch startLatch = new CountDownLatch(1);             // 发令枪
+        CountDownLatch doneLatch = new CountDownLatch(threadCount);    // 全部完成
+
+        for (int i = 0; i < threadCount; i++) {
+            es.submit(() -> {
+                readyLatch.countDown();
+                try {
+                    startLatch.await();          // 等发令枪响，300 线程同时开跑
+                    for (int j = 0; j < perThread; j++) {
+                        long id = redisIdWorker.nextId("order");
+                        ids.add(id);
+                        allIds.add(id);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        readyLatch.await();                      // 等所有线程就绪
+        long begin = System.currentTimeMillis();
+        startLatch.countDown();                  // 发令！
+        doneLatch.await();                       // 等全部完成
+        long end = System.currentTimeMillis();
+        es.shutdown();
+
+        int total = threadCount * perThread;
+        log.info("=== 全局唯一 ID 压测 ===");
+        log.info("线程数={}, 每线程={}, 总计={}", threadCount, perThread, total);
+        log.info("总耗时={} ms, 吞吐≈{} 个/秒", (end - begin),
+                (long) (total * 1000.0 / Math.max(1, end - begin)));
+        log.info("实际生成={} 个, 去重后={} 个", allIds.size(), ids.size());
+
+        // 断言 1：唯一性
+        org.junit.jupiter.api.Assertions.assertEquals(total, ids.size(),
+                "ID 出现重复！生成 " + total + " 个但去重后只有 " + ids.size() + " 个");
+
+        // 断言 2：结构反解 —— 高 32 位应当约等于「从 2022-01-01 至今的秒数」
+        long sampleId = allIds.get(0);
+        long extractedTs = sampleId >>> 32;              // 取高 32 位 = 时间戳
+        long extractedCount = sampleId & 0xFFFFFFFFL;    // 取低 32 位 = 序列号
+        long expectedTs = LocalDateTime.now().toEpochSecond(ZoneOffset.UTC) - 1640995200L;
+        log.info("样本 ID = {}", sampleId);
+        log.info("  反解时间戳 = {} (期望约 {})", extractedTs, expectedTs);
+        log.info("  反解序列号 = {}", extractedCount);
+
+        org.junit.jupiter.api.Assertions.assertTrue(
+                Math.abs(extractedTs - expectedTs) <= 5,
+                "反解出的时间戳与当前时间偏差过大：" + extractedTs + " vs " + expectedTs);
+
+        log.info("✅ 唯一性通过：{} 个 ID 无重复", total);
+    }
 }
+
