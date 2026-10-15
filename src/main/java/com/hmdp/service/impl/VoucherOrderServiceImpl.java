@@ -8,10 +8,10 @@ import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,7 +35,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private RedisIdWorker redisIdWorker;                    // 生成订单ID
 
     @Resource
-    private StringRedisTemplate stringRedisTemplate;        // 分布式锁用
+    private RedissonClient redissonClient;                  // 分布式锁
 
     /**
      * 秒杀下单入口：只做前置校验（不涉及并发写），加锁后交给 createVoucherOrder 完成下单
@@ -60,12 +60,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail("库存不足！");
         }
 
-        // 5. 取当前用户，并用「用户级」的 Redis 分布式锁替代 synchronized（可跨 JVM）
+        // 5. 取当前用户，用 Redisson 分布式锁（替代自研锁：支持可重入/重试/看门狗续期）
         Long userId = UserHolder.getUser().getId();
-        SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
 
-        // 6. 抢锁；抢不到说明该用户已有请求在处理，直接拒绝（1200 为锁的自动过期秒数）
-        boolean isLocked = lock.tryLock(1200);
+        // 6. 抢锁：不传 leaseTime，交给看门狗自动续期（默认 30s，每 10s 续一次）
+        boolean isLocked = lock.tryLock();
         if (!isLocked) {
             return Result.fail("请勿重复下单！");
         }

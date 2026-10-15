@@ -74,6 +74,17 @@
             <artifactId>aspectjweaver</artifactId>
             <version>1.9.7</version>
         </dependency>
+        <!--
+            Redisson：第 5 章分布式锁。
+            解决自研 Redis 锁的 4 个问题：可重入、可重试、超时续期(看门狗)、主从一致性(MultiLock)。
+            注意用 core 包而非 redisson-spring-boot-starter，避免与 Spring Boot 2.3.12 的
+            自动配置产生版本冲突（starter 面向较新的 Boot 版本）。
+        -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson</artifactId>
+            <version>3.13.6</version>
+        </dependency>
     </dependencies>
 
     <build>

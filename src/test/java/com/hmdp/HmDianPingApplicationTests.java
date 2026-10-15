@@ -13,6 +13,8 @@ import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.boot.test.context.SpringBootTest;
 
 import javax.annotation.Resource;
@@ -345,6 +347,87 @@ class HmDianPingApplicationTests {
             log.info("✅ 一人一单通过：同一用户只生成 1 张订单");
         } else {
             log.error("❌ 一人一单失败：同一用户生成了 {} 张订单！", ordersOfThisUser);
+        }
+    }
+
+    // ==================== 第 5 章 Redisson ====================
+
+    @Resource
+    private RedissonClient redissonClient;
+
+    /**
+     * 【5.2 快速入门】Redisson 可重入锁基本用法
+     */
+    @Test
+    void testRedisson() throws InterruptedException {
+        // 1. 获取锁对象（此时还没有加锁，只是拿到一个 RLock 句柄）
+        RLock lock = redissonClient.getLock("lock:test");
+
+        // 2. tryLock(等待时间, 锁自动释放时间, 单位)：等待时间内会重试
+        boolean isLock = lock.tryLock(1, 10, TimeUnit.SECONDS);
+        log.info("=== Redisson 加锁 ===");
+        log.info("tryLock 结果 = {}", isLock);
+
+        if (isLock) {
+            try {
+                log.info("已持有锁，isLocked() = {}, isHeldByCurrentThread() = {}",
+                        lock.isLocked(), lock.isHeldByCurrentThread());
+                log.info("锁剩余时间 = {} ms", lock.remainTimeToLive());
+            } finally {
+                lock.unlock();
+                log.info("已释放锁，isLocked() = {}", lock.isLocked());
+            }
+        }
+    }
+
+    /**
+     * 【5.4 看门狗验证】不指定释放时间时，Redisson 会自动续期
+     *
+     * 默认锁有效期 30s，看门狗每 10s（1/3）续期一次，使锁一直存活到业务结束。
+     * 这里只持有 25 秒并观察 TTL 变化，验证"未到期就被续上"。
+     */
+    @Test
+    void testRedissonWatchDog() throws InterruptedException {
+        RLock lock = redissonClient.getLock("lock:dog");
+        // 只传等待时间、不传 leaseTime → 触发看门狗自动续期
+        lock.tryLock(1, TimeUnit.SECONDS);
+        try {
+            log.info("=== 看门狗验证（默认 30s 有效期，每 10s 续期）===");
+            for (int i = 1; i <= 3; i++) {
+                log.info("第 {} 次观察：锁 TTL = {} ms", i, lock.remainTimeToLive());
+                Thread.sleep(10000);
+            }
+            log.info("第 4 次观察（已过 30s）：锁 TTL = {} ms ← 若仍 > 0 说明被续期了",
+                    lock.remainTimeToLive());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 【5.4 对照实验】显式指定 leaseTime 时，看门狗【不生效】
+     *
+     * 与 testRedissonWatchDog 的唯一区别：tryLock 传了 leaseTime=10s。
+     * 预期：10 秒后锁自动消失，即使业务还在跑 —— 这正是自研简单锁的隐患。
+     * 结论：只有【不传 leaseTime】才会启用看门狗自动续期。
+     */
+    @Test
+    void testRedissonNoWatchDog() throws InterruptedException {
+        RLock lock = redissonClient.getLock("lock:dog2");
+        // 3 个参数：等待 1 秒、显式租约 10 秒（指定后看门狗不介入）
+        lock.tryLock(1, 10, TimeUnit.SECONDS);
+        try {
+            log.info("=== 对照实验：显式 leaseTime=10s，看门狗不生效 ===");
+            log.info("刚加锁：TTL = {} ms, isLocked = {}", lock.remainTimeToLive(), lock.isLocked());
+            Thread.sleep(12000);
+            log.info("12 秒后：TTL = {} ms, isLocked = {} ← 锁已过期消失",
+                    lock.remainTimeToLive(), lock.isLocked());
+        } finally {
+            // 锁可能已自动过期，此时 unlock 会抛异常，故先判断
+            if (lock.isLocked() && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+            log.info("已结束对照实验");
         }
     }
 }
