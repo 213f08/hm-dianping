@@ -1,9 +1,16 @@
 package com.hmdp;
 
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.hmdp.dto.Result;
+import com.hmdp.dto.UserDTO;
+import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.Shop;
+import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IShopService;
+import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -13,12 +20,14 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
@@ -154,6 +163,189 @@ class HmDianPingApplicationTests {
                 "反解出的时间戳与当前时间偏差过大：" + extractedTs + " vs " + expectedTs);
 
         log.info("✅ 唯一性通过：{} 个 ID 无重复", total);
+    }
+
+    // ==================== 3.5 库存超卖复现 ====================
+
+    @Resource
+    private IVoucherOrderService voucherOrderService;
+
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    /** 测试用秒杀券 id（数据库 tb_seckill_voucher 中 stock=100 的那张） */
+    private static final Long VOUCHER_ID = 10L;
+
+    /**
+     * 【3.5 超卖复现】用真并发打 Service 层，看库存会不会被扣成负数
+     *
+     * 为什么并发数（200）必须【大于】库存（100）？
+     *   超卖的本质是「读到旧值 → 再写」的竞态。如果线程数 ≤ 库存，
+     *   理论上每个线程都能成功，即使实现有 bug 也看不出负数。
+     *   只有「抢的人比货多」，失败者才会把库存扣穿，暴露 stock < 0。
+     */
+    @Test
+    void testSeckillOversell() throws InterruptedException {
+        int threadCount = 200;   // 抢购人数：必须 > 库存 100
+
+        // ---- 记录每个线程的调用结果 ----
+        AtomicInteger successCount = new AtomicInteger();   // 下单成功的线程数
+        AtomicInteger failCount = new AtomicInteger();      // 被拒绝的线程数
+        // 保存失败原因（用 Map 统计每种 errorMsg 出现了几次）
+        Map<String, AtomicInteger> failReasons = new ConcurrentHashMap<>();
+
+        ExecutorService es = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch readyLatch = new CountDownLatch(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);   // 发令枪
+        CountDownLatch doneLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            // 每个线程分配一个【不同的】userId，模拟 200 个不同用户来抢
+            final long userId = 1000L + i;
+            es.submit(() -> {
+                try {
+                    // 关键：UserHolder 是 ThreadLocal，测试线程不走登录拦截器，
+                    // 必须【手动塞用户】，否则 seckillVoucher 里 UserHolder.getUser() 返回 null → NPE
+                    UserDTO user = new UserDTO();
+                    user.setId(userId);
+                    user.setNickName("test-user-" + userId);
+                    UserHolder.saveUser(user);
+
+                    readyLatch.countDown();
+                    startLatch.await();      // 等发令枪，让 200 个线程尽量同时冲
+
+                    Result result = voucherOrderService.seckillVoucher(VOUCHER_ID);
+
+                    if (Boolean.TRUE.equals(result.getSuccess())) {
+                        successCount.incrementAndGet();
+                    } else {
+                        failCount.incrementAndGet();
+                        failReasons.computeIfAbsent(result.getErrorMsg(),
+                                k -> new AtomicInteger()).incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    failCount.incrementAndGet();
+                    failReasons.computeIfAbsent("异常:" + e.getClass().getSimpleName(),
+                            k -> new AtomicInteger()).incrementAndGet();
+                } finally {
+                    UserHolder.removeUser();   // 必须清理，避免线程池复用污染
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        readyLatch.await();
+        long begin = System.currentTimeMillis();
+        startLatch.countDown();              // 🔫 发令！
+        doneLatch.await();
+        long end = System.currentTimeMillis();
+        es.shutdown();
+
+        // ---- 查数据库最终状态：这才是铁证 ----
+        SeckillVoucher voucher = seckillVoucherService.getById(VOUCHER_ID);
+        long orderCount = voucherOrderService.count(
+                new QueryWrapper<com.hmdp.entity.VoucherOrder>().eq("voucher_id", VOUCHER_ID));
+
+        log.info("=== 3.5 超卖复现结果 ===");
+        log.info("抢购人数={}, 耗时={} ms", threadCount, (end - begin));
+        log.info("下单成功={}, 被拒绝={}", successCount.get(), failCount.get());
+        log.info("失败原因分布={}", failReasons);
+        log.info("--------------------------------");
+        log.info("数据库剩余库存 stock = {}", voucher.getStock());
+        log.info("实际生成订单数 = {}", orderCount);
+
+        // 理论正确值：库存 100，只能成功 100 单，剩余 0
+        log.info("期望值：成功=100, 库存=0, 订单=100");
+        if (voucher.getStock() < 0) {
+            log.error("❌ 出现超卖！库存被扣成 {}，说明有 {} 件商品被超卖",
+                    voucher.getStock(), -voucher.getStock());
+        } else {
+            log.info("✅ 未超卖");
+        }
+        if (successCount.get() > 100) {
+            log.error("❌ 超卖确认：成功下单 {} 次 > 库存 100 件", successCount.get());
+        }
+    }
+
+    // ==================== 3.6 一人一单 验证 ====================
+
+    /**
+     * 【3.6 一人一单】同一个用户，用 50 个线程同时抢同一张券
+     *
+     * 预期：只有 1 单成功，其余 49 次被「用户已经购买过一次！」拒绝。
+     *
+     * 为什么这个测试能测出问题？
+     *   如果没有加锁，50 个线程会同时执行 count 查询，
+     *   都查到 0（因为都还没插入），然后全部去 insert
+     *   → 同一个用户产生多张订单。
+     *
+     * 注意：这里 50 个线程用的都是【同一个 userId】，
+     *   这正是 synchronized(userId.toString().intern()) 要串行化的场景。
+     */
+    @Test
+    void testOneOrderPerUser() throws InterruptedException {
+        int threadCount = 50;
+        final long sameUserId = 2001L;    // 同一个用户
+
+        AtomicInteger successCount = new AtomicInteger();
+        Map<String, AtomicInteger> failReasons = new ConcurrentHashMap<>();
+
+        ExecutorService es = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch readyLatch = new CountDownLatch(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            es.submit(() -> {
+                try {
+                    UserDTO user = new UserDTO();
+                    user.setId(sameUserId);
+                    user.setNickName("same-user");
+                    UserHolder.saveUser(user);
+
+                    readyLatch.countDown();
+                    startLatch.await();
+
+                    Result result = voucherOrderService.seckillVoucher(VOUCHER_ID);
+                    if (Boolean.TRUE.equals(result.getSuccess())) {
+                        successCount.incrementAndGet();
+                    } else {
+                        failReasons.computeIfAbsent(result.getErrorMsg(),
+                                k -> new AtomicInteger()).incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    failReasons.computeIfAbsent("异常:" + e.getClass().getSimpleName(),
+                            k -> new AtomicInteger()).incrementAndGet();
+                } finally {
+                    UserHolder.removeUser();
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        readyLatch.await();
+        startLatch.countDown();
+        doneLatch.await();
+        es.shutdown();
+
+        // 查这个用户实际产生了几张订单
+        long ordersOfThisUser = voucherOrderService.count(
+                new QueryWrapper<com.hmdp.entity.VoucherOrder>()
+                        .eq("user_id", sameUserId).eq("voucher_id", VOUCHER_ID));
+
+        log.info("=== 3.6 一人一单验证 ===");
+        log.info("线程数={}（同一用户 id={}）", threadCount, sameUserId);
+        log.info("下单成功={}, 被拒绝={}", successCount.get(), 50 - successCount.get());
+        log.info("失败原因分布={}", failReasons);
+        log.info("--------------------------------");
+        log.info("该用户在库中的订单数 = {}", ordersOfThisUser);
+        log.info("期望：成功=1, 订单数=1");
+
+        if (ordersOfThisUser == 1) {
+            log.info("✅ 一人一单通过：同一用户只生成 1 张订单");
+        } else {
+            log.error("❌ 一人一单失败：同一用户生成了 {} 张订单！", ordersOfThisUser);
+        }
     }
 }
 

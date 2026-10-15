@@ -59,6 +59,21 @@
             <artifactId>hutool-all</artifactId>
             <version>5.7.17</version>
         </dependency>
+        <!--
+            AOP 依赖：用于「一人一单」中获取当前对象的代理（AopContext.currentProxy()）。
+            为什么需要它？
+              @Transactional 依赖 Spring 的【动态代理】才能生效。
+              seckillVoucher() 内部直接 this.createVoucherOrder() 是【同类内部调用】，
+              不会走代理 → 事务注解形同虚设（这是 Spring 事务最经典的失效场景之一）。
+              所以必须通过 AopContext.currentProxy() 拿到代理对象，再由代理去调用。
+            版本说明：Spring Boot 2.3.12 默认管理 1.9.6，但本机 .m2 只有 1.9.7，
+                      故显式指定版本以便离线构建。
+        -->
+        <dependency>
+            <groupId>org.aspectj</groupId>
+            <artifactId>aspectjweaver</artifactId>
+            <version>1.9.7</version>
+        </dependency>
     </dependencies>
 
     <build>
