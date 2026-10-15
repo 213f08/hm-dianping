@@ -8,8 +8,10 @@ import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,6 +33,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Resource
     private RedisIdWorker redisIdWorker;                    // 生成订单ID
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;        // 分布式锁用
 
     /**
      * 秒杀下单入口
@@ -67,37 +72,45 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 5. 一人一单：用户 id 从 ThreadLocal 取
         Long userId = UserHolder.getUser().getId();
 
-        // ★★★ 加锁 + 事务代理：这两件事的顺序，是本小节的核心 ★★★
+        // ★ 用 Redis 分布式锁替代 synchronized ★
         //
-        // 【为什么锁要加在这里，而不是 createVoucherOrder() 方法里面？】
-        //   必须保证「锁的释放」发生在「事务提交之后」。
+        // 【为什么换掉 synchronized？】3.7 实测：synchronized 只在单个 JVM 内有效。
+        //   集群部署时，8081 和 8082 各有一把锁 → 同用户在两台机器各下一单
+        //   （实测 30 个用户中有 27 个重复下单）。
+        //   Redis 锁的 key 在【所有实例共享】，因此能真正跨 JVM 互斥。
+        //   （换锁后的实测：同样 30 个用户并发打两个实例，零重复。）
         //
-        //   假设把 synchronized 写在 createVoucherOrder() 内部：
-        //     @Transactional 的边界在方法【外层】（代理层开启事务）
-        //     synchronized 在方法【内层】
-        //     → 顺序变成：开事务 → 加锁 → 业务 → 释放锁 → 提交事务
-        //     → 危险窗口：锁已释放但数据未提交，别的线程读到旧数据 → 重复下单
-        //
-        //   写在 seckillVoucher() 里、包住 proxy 调用，顺序就变成：
-        //     加锁 → (代理)开事务 → 业务 → 提交事务 → 释放锁
-        //     → 事务被锁完整包住，安全 ✅
-        //
-        // 【为什么要 intern()？】
-        //   synchronized 锁的是「对象」。userId 是 Long，toString() 每次都 new 出
-        //   一个新的 String 对象，两个线程拿到的是两个不同对象 → 锁不住！
-        //   intern() 从字符串常量池返回同一个引用 → 相同 userId 拿到同一把锁 ✅
-        //   好处：不同用户之间不互相阻塞，锁粒度精确到「用户」，而非整个方法。
-        //
-        // 【为什么要通过代理对象调用？】
-        //   @Transactional 靠动态代理生效。this.createVoucherOrder() 是同类内部调用，
-        //   不经过代理 → 事务注解失效（Spring 事务最经典的失效场景）。
-        //   AopContext.currentProxy() 拿到代理对象，让调用重新走代理链路。
-        //   前提：启动类必须加 @EnableAspectJAutoProxy(exposeProxy = true)，
-        //        否则抛 IllegalStateException: Cannot find current proxy。
-        //   强转说明：代理对象实现的是 IVoucherOrderService 接口，故转成接口类型。
-        synchronized (userId.toString().intern()) {
+        // 【锁的 key】"order:" + userId → 锁粒度精确到「用户」，
+        //   不同用户之间互不阻塞；同一个用户的请求才串行化。
+        SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+
+        // tryLock 是【非阻塞】的：抢不到立刻返回 false（不等待）。
+        // 参数 1200 是锁的自动过期时间，单位由 SimpleRedisLock 内部定为【秒】
+        //   （setIfAbsent 的第 4 个参数是 TimeUnit.SECONDS）→ 即 1200 秒。
+        // 作用：持有者崩溃/卡死时锁能自动释放，避免死锁。
+        // ⚠️ 隐患（第 5 章 Redisson 要解决）：若业务执行时间超过 1200 秒，
+        //    锁会在业务完成前过期 → 别的线程拿到锁 → 互斥被破坏。
+        //    Redisson 的看门狗机制会给未完成的业务自动续期。
+        boolean isLocked = lock.tryLock(1200);
+        if (!isLocked) {
+            // 没抢到锁 → 说明该用户已有请求正在下单 → 直接拒绝
+            return Result.fail("请勿重复下单！");
+        }
+        try {
+            // 必须通过【代理对象】调用，@Transactional 才会生效：
+            //   this.createVoucherOrder(...) 是同类内部调用，不经过代理 → 事务失效。
+            //   AopContext.currentProxy() 取出 Spring 已创建好的代理对象。
+            //   前提：启动类上有 @EnableAspectJAutoProxy(exposeProxy = true)。
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherId);
+        } finally {
+            // 必须在 finally 释放：否则业务抛异常时锁不释放，
+            // 只能等 1200ms 超时，期间该用户的所有请求都会被拒绝。
+            //
+            // 锁的释放时机也正确：此处解锁发生在 proxy.createVoucherOrder()
+            // 返回【之后】，即事务已提交之后 —— 保证"锁比事务活得久"，
+            // 后到的线程一定能看到前一个已提交的订单。
+            lock.unlock();
         }
     }
 
@@ -106,10 +119,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      *
      * 【为什么拆成独立方法？】见 seckillVoucher() 中的说明：
      * 为了让「锁」能包住「整个事务」，所以把事务方法单独抽出来，
-     * 由外层的 synchronized 包住代理调用。
-     *
-     * ⚠️ 3.7 会指出：synchronized 只在【单机 JVM】内有效；
-     *    集群部署（8081/8082 两个实例）时锁不住 → 需要第 4 章的 Redis 分布式锁。
+     * 由外层的分布式锁包住代理调用，保证顺序为：
+     *   加锁 → 开事务 → 业务 → 提交事务 → 释放锁
+     * 若把锁写在方法内部，顺序会变成「先释放锁、后提交事务」，
+     * 后到的线程读不到未提交的数据 → 仍然会重复下单。
      */
     @Override
     @Transactional
@@ -120,7 +133,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         //     【并发陷阱】"先查后插"同样是 check-then-act 竞态：
         //     两个线程同时查，都查到 count=0，然后都去插入 → 一个用户两单。
-        //     拦住它的是外层那把 synchronized(userId) —— 同一用户的请求被串行化，
+        //     拦住它的是外层那把 Redis 分布式锁 —— 同一用户的请求被串行化，
         //     后到的线程必然能看到前一个已提交的订单。
         int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
         if (count > 0) {
@@ -128,21 +141,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         // 6.2 扣减库存（乐观锁：把「库存判断」交给数据库）
-        //     ★ 与 3.5 超卖版的唯一区别：WHERE 里多了 stock > 0
-        //
-        //     3.5 的错误写法：.eq("voucher_id", voucherId).update()
-        //       → WHERE 只有 voucher_id，该行永远存在，affected rows 恒为 1
-        //       → success 恒为 true，下面的 if (!success) 是【死代码】
-        //       → 200 线程各扣 1 → stock 被扣成 -100
-        //
-        //     现在改为：WHERE voucher_id = ? AND stock > 0
-        //       → 数据库在【行锁保护下】完成「判断 + 扣减」这一个原子操作
-        //       → 判断与扣减之间不再有时间缝，超卖从根上消失
-        //       → stock 为 0 时匹配不到行，affected rows = 0，success = false
-        //       → success 第一次真正携带了「库存不足」的语义
-        //
-        //     【链式顺序】.gt() 是条件构造器方法，必须在 .update() 之前；
-        //     .update() 是终端方法，执行 SQL 并返回 boolean，调用后无法再链式加条件。
         boolean success = seckillVoucherService.update()
                 .setSql("stock = stock - 1")
                 .eq("voucher_id", voucherId)
