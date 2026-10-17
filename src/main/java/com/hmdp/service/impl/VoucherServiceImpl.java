@@ -17,12 +17,7 @@ import java.util.List;
 import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
 
 /**
- * <p>
- *  服务实现类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
+ * 优惠券服务：新增秒杀券时同步库存到 Redis
  */
 @Service
 public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> implements IVoucherService {
@@ -33,29 +28,27 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    /** 查询店铺的优惠券列表 */
     @Override
     public Result queryVoucherOfShop(Long shopId) {
-        // 查询优惠券信息
         List<Voucher> vouchers = getBaseMapper().queryVoucherOfShop(shopId);
-        // 返回结果
         return Result.ok(vouchers);
     }
 
+    /** 新增秒杀券：写两张表 + 同步库存到 Redis（第 6 章 Lua 扣减的起点） */
     @Override
     @Transactional
     public void addSeckillVoucher(Voucher voucher) {
-        // 保存优惠券
+        // 1. 保存券基本信息
         save(voucher);
-        // 保存秒杀信息
+        // 2. 保存秒杀扩展信息
         SeckillVoucher seckillVoucher = new SeckillVoucher();
         seckillVoucher.setVoucherId(voucher.getId());
         seckillVoucher.setStock(voucher.getStock());
         seckillVoucher.setBeginTime(voucher.getBeginTime());
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);
-        // 保存秒杀库存到 Redis 中
-        // 第 6 章「秒杀优化」会把扣库存的动作从 MySQL 挪到 Redis（Lua 脚本原子扣减），
-        // 这里先把初始库存同步过去，作为后续 Redis 扣减的起点。
+        // 3. 库存同步到 Redis，供秒杀时快速判断
         stringRedisTemplate.opsForValue()
                 .set(SECKILL_STOCK_KEY + voucher.getId(), voucher.getStock().toString());
     }
